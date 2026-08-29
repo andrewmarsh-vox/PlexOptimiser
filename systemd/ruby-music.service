@@ -1,0 +1,9 @@
+[Unit]
+Description=Ruby - Plex Optimiser: music optimiser (compatibility + ReplayGain, CPU-only)
+After=network.target
+
+[Service]
+Type=oneshot
+Nice=15
+IOSchedulingClass=idle
+ExecStart=/home/naboo/ruby/ruby-music.sh

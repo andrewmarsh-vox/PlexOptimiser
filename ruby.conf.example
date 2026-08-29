@@ -1,0 +1,15 @@
+# Ruby - Plex Optimiser settings. Copy to ruby.conf. Edited live by the web dashboard on :8800.
+SCAN_MIN_MB=500
+PLEX_LIB_TYPES="movie show music"
+Q_4K=24
+Q_1080=23
+MIN_MBPS_4K=28
+MIN_MBPS_1080=18
+ADD_AC3=1
+ADD_AAC=1
+BAD_VIDEO="vc1 mpeg2video av1 mpeg4 msmpeg4v3 wmv3 vp6f vp6 rv40"
+GOV_ENABLED=1
+GOV_GPU_MAX=95
+GOV_POLL_SEC=5
+GOV_MIN_PCT=10
+GOV_NICE_IDLE=0

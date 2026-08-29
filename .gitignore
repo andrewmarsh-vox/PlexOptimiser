@@ -1,0 +1,24 @@
+# Runtime state and operational data — machine-specific, and contains a full
+# listing of the media library. Never published.
+state/
+scratch/
+pending/
+
+# Logs
+*.log
+
+# Secrets
+.session_secret
+
+# Local, host-specific overrides written by the dashboard at :8800.
+# Ship ruby.conf.example instead.
+ruby.conf
+
+# Backups and build noise
+*.bak
+*.bak.*
+__pycache__/
+batch.out
+
+# Not part of the optimiser (Soulseek housekeeping, lives in the same dir)
+slskd-cleanup.sh

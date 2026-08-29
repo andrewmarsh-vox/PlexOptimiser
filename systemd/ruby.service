@@ -1,0 +1,19 @@
+[Unit]
+Description=Ruby - Plex Optimiser (by Andrew Marsh) — Plex direct-play optimiser
+After=local-fs.target mnt-disks-16TBSeagate.mount mnt-disks-5TBSeagate.mount
+Wants=local-fs.target
+
+[Service]
+Type=simple
+# Resume-safe: skips files in state/done.list; a mid-flight file's scratch output is discarded, original intact.
+ExecStartPre=/bin/bash -c 'rm -f /home/naboo/ruby/scratch/*.hevc.mkv'
+ExecStart=/home/naboo/ruby/ruby.sh
+WorkingDirectory=/home/naboo/ruby
+Nice=10
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/naboo/ruby/service.log
+StandardError=append:/home/naboo/ruby/service.log
+
+[Install]
+WantedBy=multi-user.target

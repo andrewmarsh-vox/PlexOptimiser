@@ -1,0 +1,9 @@
+[Unit]
+Description=Ruby - Plex Optimiser: monthly library rescan + refresh to-do plan
+After=network.target docker.service
+Wants=mnt-disks-16TBSeagate.mount mnt-disks-5TBSeagate.mount
+
+[Service]
+Type=oneshot
+ExecStart=/home/naboo/ruby/rescan.sh
+User=root

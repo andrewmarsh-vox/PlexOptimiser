@@ -1,0 +1,12 @@
+[Unit]
+Description=Ruby - Plex Optimiser: Plex-first resource governor
+After=network.target ruby.service
+
+[Service]
+Type=simple
+ExecStart=/home/naboo/ruby/ruby-governor.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

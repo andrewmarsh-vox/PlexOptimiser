@@ -1,0 +1,13 @@
+[Unit]
+Description=Ruby - Plex Optimiser: web dashboard (:8800)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/naboo/ruby/dashboard.py
+WorkingDirectory=/home/naboo/ruby
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

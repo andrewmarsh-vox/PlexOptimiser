@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Ruby - Plex Optimiser rescan monthly (1st of month, 05:00)
+
+[Timer]
+OnCalendar=*-*-01 05:00:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=ruby-rescan.service
+
+[Install]
+WantedBy=timers.target
