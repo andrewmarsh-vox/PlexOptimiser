@@ -27,14 +27,22 @@ STATE="/home/naboo/ruby/state"; DONE="$STATE/music-flac.done"
 PLAN_TSV="$STATE/plan.tsv"          # the optimiser queue the dashboard renders
 DONE_LIST="$STATE/done.list"        # optimiser resume marker
 STATS_TSV="$STATE/converted.tsv"    # durable per-file savings record
-CUR_MUSIC="$STATE/current-music.json"  # what the audio worker is on right now
-CUR_MUSIC_PROG="$STATE/current-music.progress"  # ffmpeg -progress for the bar
+# Per-worker telemetry. With MUSIC_JOBS>1 several encoders run at once, so each
+# writes its own slot (keyed by subshell PID) - a single shared progress file would
+# interleave ffmpeg output from every worker and make the bar jump.
+CUR_MUSIC_DIR="$STATE/music-current"; mkdir -p "$CUR_MUSIC_DIR"
+rm -f "$CUR_MUSIC_DIR"/*.json "$CUR_MUSIC_DIR"/*.progress 2>/dev/null
 DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
 
 # House target for music. 320 = MP3-320 CBR. Set MUSIC_DOWNCONVERT=1 to enforce it
 # on files that are currently BETTER (lossless) — this deletes the lossless original.
 MUSIC_DOWNCONVERT="${MUSIC_DOWNCONVERT:-0}"
 MUSIC_TARGET_KBPS="${MUSIC_TARGET_KBPS:-320}"
+# Parallel encodes. Measured on this N100 (4 cores, while the video encoder was
+# running): 1 job = 5221ms/track, 2 = 3502ms (1.49x), 3 = 3396ms, 4 = 3132ms.
+# Nearly all the win is in the first extra job, so 2 is the default - higher
+# values mostly add IO contention and steal cores from Plex.
+MUSIC_JOBS="${MUSIC_JOBS:-2}"
 
 INCOMPAT="ape wmav1 wmav2 wmalossless wmapro tak tta wavpack musepack mpc als shorten optimfrog"
 LOSSLESS="flac alac ape wavpack tak tta wmalossless shorten optimfrog pcm_s16le pcm_s24le pcm_s32le"
@@ -47,7 +55,7 @@ RUBY_MUSIC_TMP=""
 _music_cleanup(){
   local rc=$?
   [ -n "${RUBY_MUSIC_TMP:-}" ] && rm -f "$RUBY_MUSIC_TMP" 2>/dev/null
-  rm -f "$CUR_MUSIC" "$CUR_MUSIC_PROG" 2>/dev/null
+  rm -f "$CUR_MUSIC_DIR"/*.json "$CUR_MUSIC_DIR"/*.progress 2>/dev/null
   log "interrupted (signal/exit rc=$rc) - telemetry cleared"
   exit $rc
 }
@@ -72,6 +80,8 @@ log "target: MP3-${MUSIC_TARGET_KBPS}  downconvert_lossless=${MUSIC_DOWNCONVERT}
 to_mp3(){
   local f="$1" why="$2"
   local od base tmp nc nd dd osz nsz
+  local CUR_MUSIC="$CUR_MUSIC_DIR/$BASHPID.json"
+  local CUR_MUSIC_PROG="$CUR_MUSIC_DIR/$BASHPID.progress"
   od="$(dur "$f")"; base="${f%.*}"; tmp="${base}.ruby.mp3"
   RUBY_MUSIC_TMP="$tmp"
   osz=$(stat -c%s "$f" 2>/dev/null || echo 0)
@@ -147,20 +157,53 @@ done < <(find -L "$ROOT" -type f \( -iname '*.flac' -o -iname '*.m4a' -o -iname 
 log "queued: $queued file(s) added to optimiser plan ($PLAN_TSV)"
 
 # ---- 2b) work the queue (only when downconvert is switched on) --------------
+# How many encodes to run at once, given what else the box is doing right now.
+# Audio is CPU-only (no GPU audio codec exists), so it competes with Plex
+# TRANSCODES and with ffmpeg's CPU side - never with the VAAPI video encode.
+audio_jobs_now(){
+  local want="$MUSIC_JOBS" cores load1 tx
+  cores=$(nproc 2>/dev/null || echo 2)
+  [ "$want" -gt "$cores" ] && want="$cores"
+  # A Plex transcode gets priority: drop to a single encoder.
+  tx=$(curl -sf -m3 "http://127.0.0.1:32400/status/sessions?X-Plex-Token=${PLEX_TOKEN:-}" 2>/dev/null \
+       | grep -o '<TranscodeSession' | wc -l)
+  [ "${tx:-0}" -gt 0 ] && { echo 1; return; }
+  # Already loaded beyond core count -> do not pile on.
+  load1=$(awk '{printf "%d", $1}' /proc/loadavg 2>/dev/null || echo 0)
+  [ "${load1:-0}" -ge "$cores" ] && { echo 1; return; }
+  echo "$want"
+}
+
 down=0; saved=0
 if [ "$MUSIC_DOWNCONVERT" = 1 ] && [ "$DRY" = 0 ]; then
+  PLEX_TOKEN="${PLEX_TOKEN:-$(grep -oP 'plex_token:\s*\K\S+' /root/media-stack/homeassistant/secrets.yaml 2>/dev/null)}"
+  JOBS=$(audio_jobs_now)
+  RESULTS="$STATE/.music-results.$$"; : > "$RESULTS"
+  log "downconvert: starting with $JOBS parallel encoder(s) (MUSIC_JOBS=$MUSIC_JOBS, $(nproc) cores)"
   while IFS=$'\t' read -r d det sz p; do
     [ "$d" = CONVERT ] || continue
     case "$det" in audio:*) ;; *) continue ;; esac
     [ -f "$p" ] || continue
     excluded "$p" && continue
-    osz=$(stat -c%s "$p" 2>/dev/null || echo 0)
-    if to_mp3 "$p" "${det%%->*}"; then
-      down=$((down+1))
-      nsz=$(stat -c%s "${p%.*}.mp3" 2>/dev/null || echo 0)
-      saved=$(( saved + osz - nsz ))
-    fi
+    (
+      osz=$(stat -c%s "$p" 2>/dev/null || echo 0)
+      if to_mp3 "$p" "${det%%->*}"; then
+        nsz=$(stat -c%s "${p%.*}.mp3" 2>/dev/null || echo 0)
+        printf '%s\t%s\n' "$osz" "$nsz" >> "$RESULTS"
+      fi
+    ) &
+    # Keep the pool full, and re-evaluate headroom as conditions change.
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do
+      wait -n 2>/dev/null || break
+      JOBS=$(audio_jobs_now)
+    done
   done < "$PLAN_TSV"
+  wait
+  if [ -s "$RESULTS" ]; then
+    down=$(grep -c "" "$RESULTS")
+    saved=$(awk -F'\t' '{s += $1 - $2} END {printf "%d", s+0}' "$RESULTS")
+  fi
+  rm -f "$RESULTS"
   log "downconvert: $down file(s) -> mp3-${MUSIC_TARGET_KBPS}, reclaimed $((saved/1000000))MB"
 else
   log "downconvert: not running (MUSIC_DOWNCONVERT=${MUSIC_DOWNCONVERT}, dry=$DRY) - items stay queued"
@@ -194,5 +237,5 @@ done < <(find -L "$ROOT" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname 
 printf '{"total":%d,"good":%d,"need_convert":%d,"need_gain":%d,"need_downconvert":%d,"ts":%d}\n' \
   "$total" "$good" "$needconv" "$needgain" "$needdown" "$(date +%s)" > "$STATE/music-status.json"
 log "status: $good good / $needgain need leveling / $needconv need convert / $needdown above target (of $total)"
-rm -f "$CUR_MUSIC" "$CUR_MUSIC_PROG"
+rm -f "$CUR_MUSIC_DIR"/*.json "$CUR_MUSIC_DIR"/*.progress 2>/dev/null
 log "=== Ruby music pass complete ==="

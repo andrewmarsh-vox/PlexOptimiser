@@ -34,8 +34,7 @@ CONVERTED = os.path.join(STATE, "converted.tsv")
 FAILED_TSV = os.path.join(STATE, "failed.tsv")
 LOG = os.path.join(BASE, "ruby.log")
 CUR_JSON = os.path.join(STATE, "current.json")
-CUR_MUSIC_JSON = os.path.join(STATE, "current-music.json")
-CUR_MUSIC_PROG = os.path.join(STATE, "current-music.progress")
+CUR_MUSIC_DIR = os.path.join(STATE, "music-current")
 CUR_PROG = os.path.join(STATE, "current.progress")
 DRIVE = "/mnt/disks/16TBSeagate"
 PORT = 8800
@@ -571,11 +570,25 @@ def build_status():
         cur = {}
     cur_src = cur.get("src", "")
     fail_map = fail_reasons()
+    # Several audio encoders may run at once (MUSIC_JOBS); each owns a slot file.
+    music_slots = []
     try:
-        with open(CUR_MUSIC_JSON) as _f: curm = json.load(_f)
+        for fn in sorted(os.listdir(CUR_MUSIC_DIR)):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(CUR_MUSIC_DIR, fn)) as _f:
+                    j = json.load(_f)
+            except Exception:
+                continue
+            if j.get("src"):
+                j["_prog"] = os.path.join(CUR_MUSIC_DIR, fn[:-5] + ".progress")
+                music_slots.append(j)
     except Exception:
-        curm = {}
+        pass
+    curm = music_slots[0] if music_slots else {}
     cur_music_src = curm.get("src", "")
+    music_srcs = {j.get("src") for j in music_slots if j.get("src")}
 
     # exact original sizes by path, from the plan
     plan_size = {}
@@ -607,7 +620,7 @@ def build_status():
         dest = os.path.join(os.path.dirname(path), stem + _ext)
         is_done = dest in done_set or path in done_set or decision == "DONE"
         is_fail = path in fail_set
-        is_cur = path in (cur_src, cur_music_src) and path and not is_done
+        is_cur = bool(path) and (path == cur_src or path in music_srcs) and not is_done
 
         row = {
             "name": base, "tier": tier_of(detail),
@@ -712,7 +725,7 @@ def build_status():
         _mdur = float(curm.get("duration") or 0)
         mprog = {}
         try:
-            with open(CUR_MUSIC_PROG, errors="replace") as _f:
+            with open(curm.get("_prog", ""), errors="replace") as _f:
                 for _l in _f:
                     if "=" in _l:
                         _k, _v = _l.rstrip("\n").split("=", 1)
@@ -726,6 +739,7 @@ def build_status():
         m_s = m_us / 1_000_000 if m_us else 0
         m_pct = min(100, m_s / _mdur * 100) if _mdur else 0
         curm_out = {
+            "active": len(music_slots),
             "base": curm.get("base", ""),
             "human": human(_msz),
             "why": curm.get("why", ""),
@@ -825,7 +839,7 @@ def build_status():
                 dest = os.path.join(os.path.dirname(path), stem + ".mp3")
                 if dest in done_set or path in done_set or decision == "DONE":
                     d += 1
-                elif path == cur_music_src:
+                elif path in music_srcs:
                     c += 1
                 elif decision == "CONVERT":
                     q += 1
@@ -1081,7 +1095,7 @@ function render(){
   if(m&&m.base){
    md.style.display='block';
    const a=data.audio||{};
-   md.innerHTML=`<b>Now converting (audio):</b> ${esc(m.base)} <span class=muted>(${m.human})</span>`+
+   md.innerHTML=`<b>Now converting (audio${m.active>1?' \u00d7'+m.active:''}):</b> ${esc(m.base)} <span class=muted>(${m.human})</span>`+
     `<span class=tier>${esc(m.why||'')}</span>`+
     `<div class=bar><i style="width:${m.pct||0}%"></i></div>`+
     `<div class=row><span>${m.pct||0}% &nbsp; ${esc(m.out_time||'')}/${esc(m.dur||'?')}</span>`+

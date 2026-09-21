@@ -24,6 +24,8 @@ MAX_FAILS=3
 # --- music (ruby-music.sh) ---------------------------------------------------
 # House target for audio. MP3-320 is transparent for playback and always direct-plays.
 MUSIC_TARGET_KBPS=320
+# Parallel audio encoders (auto-drops to 1 under Plex transcode or high load).
+MUSIC_JOBS=2
 # 1 = also downconvert files BETTER than the target (FLAC/ALAC/24bit -> MP3-320).
 # LOSSY AND IRREVERSIBLE: the lossless original is deleted after verification.
 MUSIC_DOWNCONVERT=0
