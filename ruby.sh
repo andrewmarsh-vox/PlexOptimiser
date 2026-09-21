@@ -83,12 +83,13 @@ mkdir -p "$SCRATCH" "$STATE_DIR" "$(dirname "$LOG")"
 DONE_LIST="$STATE_DIR/done.list"; FAIL_LIST="$STATE_DIR/failed.list"
 MAX_FAILS="${MAX_FAILS:-3}"   # give up on a file after this many failed attempts
 FAIL_TSV="$STATE_DIR/failed.tsv"   # ts<TAB>reason<TAB>path - so the dashboard can show WHY
+PROBE_CACHE="$STATE_DIR/probe.cache"   # path<TAB>mtime<TAB>size<TAB>w<TAB>h<TAB>codec<TAB>pixfmt<TAB>prim<TAB>trc<TAB>fps<TAB>dur
 # Durable per-file conversion stats (append-only, never regenerated): each DONE
 # appends ts<TAB>mode<TAB>orig_bytes<TAB>new_bytes<TAB>delta_bytes<TAB>dest. The
 # original size is knowable ONLY here (the source is deleted right after), and this
 # survives plan.tsv rescans + log rotation — so all-time savings stay exact.
 STATS_TSV="$STATE_DIR/converted.tsv"
-touch "$DONE_LIST" "$FAIL_LIST" "$STATS_TSV" "$FAIL_TSV"
+touch "$DONE_LIST" "$FAIL_LIST" "$STATS_TSV" "$FAIL_TSV" "$PROBE_CACHE"
 log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 
 # Clean shutdown: systemd stop / Ctrl-C must not leave stale telemetry (the dashboard
@@ -274,7 +275,23 @@ vcodec_of(){ ffprobe -v error -select_streams v:0 -show_entries stream=codec_nam
 # library that is ~40k fewer process spawns (and file-header reads) per pass.
 # Fields are exposed as PB_* globals; callers must call probe_src first.
 PB_W=""; PB_H=""; PB_VCODEC=""; PB_PIXFMT=""; PB_PRIM=""; PB_TRC=""; PB_FPSR=""; PB_DUR=""
-probe_src(){  # $1=file
+# Probe results keyed by path, validated against (mtime,size) so any edit or
+# replacement invalidates the entry. A static library re-scans with no ffprobe at
+# all: the 4,200+ files that classify as SKIP every pass were the bulk of the work.
+declare -A PROBE_CACHE_MAP=()
+_probe_cache_loaded=0
+probe_cache_load(){
+  [ "$_probe_cache_loaded" = 1 ] && return 0
+  _probe_cache_loaded=1
+  [ -r "$PROBE_CACHE" ] || return 0
+  local line path rest
+  while IFS= read -r line; do
+    path="${line%%$'\t'*}"; rest="${line#*$'\t'}"
+    [ -n "$path" ] && PROBE_CACHE_MAP["$path"]="$rest"
+  done < "$PROBE_CACHE"
+}
+
+probe_src_uncached(){  # $1=file
   PB_W=""; PB_H=""; PB_VCODEC=""; PB_PIXFMT=""; PB_PRIM=""; PB_TRC=""; PB_FPSR=""; PB_DUR=""
   local k v
   while IFS='=' read -r k v; do
@@ -297,6 +314,41 @@ probe_src(){  # $1=file
   [ "$PB_TRC"    = "N/A" ] && PB_TRC=""
   [ "$PB_FPSR"   = "N/A" ] && PB_FPSR=""
   [ "$PB_DUR"    = "N/A" ] && PB_DUR=""
+}
+
+probe_src(){  # $1=file  - cached wrapper around probe_src_uncached
+  probe_cache_load
+  local f="$1" st mt sz hit
+  st=$(stat -c '%Y %s' -- "$f" 2>/dev/null) || { probe_src_uncached "$f"; return; }
+  mt="${st%% *}"; sz="${st##* }"
+  hit="${PROBE_CACHE_MAP["$f"]:-}"
+  if [ -n "$hit" ]; then
+    local c_mt c_sz
+    IFS=$'\t' read -r c_mt c_sz PB_W PB_H PB_VCODEC PB_PIXFMT PB_PRIM PB_TRC PB_FPSR PB_DUR <<<"$hit"
+    if [ "$c_mt" = "$mt" ] && [ "$c_sz" = "$sz" ]; then
+      return 0                      # cache hit: no ffprobe at all
+    fi
+  fi
+  probe_src_uncached "$f"
+  # Append-only writes are cheap and crash-safe; compact when the file grows past
+  # ~2x the map size so re-probed entries do not accumulate forever.
+  if [ $(( ${#PROBE_CACHE_MAP[@]} + 1 )) -gt 200 ]; then
+    local _rows; _rows=$(grep -c "" "$PROBE_CACHE" 2>/dev/null | head -n1); _rows="${_rows:-0}"
+    if [ "$_rows" -gt $(( ${#PROBE_CACHE_MAP[@]} * 2 )) ]; then
+      local _tmpc="$PROBE_CACHE.compact.$$"
+      : > "$_tmpc"
+      local _k
+      for _k in "${!PROBE_CACHE_MAP[@]}"; do
+        printf '%s\t%s\n' "$_k" "${PROBE_CACHE_MAP["$_k"]}" >> "$_tmpc"
+      done
+      mv -f "$_tmpc" "$PROBE_CACHE" && log "probe cache compacted: $_rows -> ${#PROBE_CACHE_MAP[@]} rows"
+    fi
+  fi
+  local row
+  printf -v row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "$mt" "$sz" "$PB_W" "$PB_H" "$PB_VCODEC" "$PB_PIXFMT" "$PB_PRIM" "$PB_TRC" "$PB_FPSR" "$PB_DUR"
+  PROBE_CACHE_MAP["$f"]="$row"
+  printf '%s\t%s\n' "$f" "$row" >> "$PROBE_CACHE"
 }
 # Do the audio tracks we are actually KEEPING include a TV-friendly codec?
 # Deliberately scoped to the kept set rather than the whole file: a source can own a
