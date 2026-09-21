@@ -1,6 +1,9 @@
 # Ruby - Plex Optimiser settings. Copy to ruby.conf. Edited live by the web dashboard on :8800.
 SCAN_MIN_MB=500
-PLEX_LIB_TYPES="movie show music"
+# Plex section types the VIDEO optimiser scans. NB Plex calls a music library
+# "artist", not "music" - listing "music" here matches nothing. Audio is handled
+# separately by ruby-music.sh (MUSIC_ROOT), so it is deliberately not listed.
+PLEX_LIB_TYPES="movie show"
 Q_4K=24
 Q_1080=23
 MIN_MBPS_4K=28
@@ -13,3 +16,18 @@ GOV_GPU_MAX=95
 GOV_POLL_SEC=5
 GOV_MIN_PCT=10
 GOV_NICE_IDLE=0
+
+# Give up on a file after this many failed attempts (it will otherwise be retried
+# every pass forever). Clear its lines from state/failed.list to force a retry.
+MAX_FAILS=3
+
+# --- music (ruby-music.sh) ---------------------------------------------------
+# House target for audio. MP3-320 is transparent for playback and always direct-plays.
+MUSIC_TARGET_KBPS=320
+# 1 = also downconvert files BETTER than the target (FLAC/ALAC/24bit -> MP3-320).
+# LOSSY AND IRREVERSIBLE: the lossless original is deleted after verification.
+MUSIC_DOWNCONVERT=0
+
+# Irreplaceable personal media - never auto-convert (originals are deleted on
+# replace). Symlinked paths are resolved, so either form is safe to list.
+EXCLUDE_ROOTS=("/mnt/disks/16TBSeagate/Home Videos")

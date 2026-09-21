@@ -268,6 +268,36 @@ sub_keep_idxs(){
 
 # first video stream codec name (tr strips any stray csv trailing comma/space)
 vcodec_of(){ ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$1" 2>/dev/null | head -n1 | tr -d ', \t'; }
+
+# ONE ffprobe for everything we need about a source: primary video stream plus the
+# container duration. This replaced 8 separate invocations per file — on a ~5k-file
+# library that is ~40k fewer process spawns (and file-header reads) per pass.
+# Fields are exposed as PB_* globals; callers must call probe_src first.
+PB_W=""; PB_H=""; PB_VCODEC=""; PB_PIXFMT=""; PB_PRIM=""; PB_TRC=""; PB_FPSR=""; PB_DUR=""
+probe_src(){  # $1=file
+  PB_W=""; PB_H=""; PB_VCODEC=""; PB_PIXFMT=""; PB_PRIM=""; PB_TRC=""; PB_FPSR=""; PB_DUR=""
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      width)           PB_W="$(printf '%s' "$v" | tr -dc '0-9')" ;;
+      height)          PB_H="$(printf '%s' "$v" | tr -dc '0-9')" ;;
+      codec_name)      PB_VCODEC="$(printf '%s' "$v" | tr -d ', \t')" ;;
+      pix_fmt)         PB_PIXFMT="$v" ;;
+      color_primaries) PB_PRIM="$v" ;;
+      color_transfer)  PB_TRC="$v" ;;
+      avg_frame_rate)  PB_FPSR="$v" ;;
+      duration)        PB_DUR="${v%%.*}" ;;
+    esac
+  done < <(ffprobe -v error -select_streams v:0 \
+             -show_entries stream=width,height,codec_name,pix_fmt,color_primaries,color_transfer,avg_frame_rate:format=duration \
+             -of default=nw=1 "$1" 2>/dev/null)
+  # ffprobe prints "N/A" for absent tags; normalise so callers can test emptiness.
+  [ "$PB_PIXFMT" = "N/A" ] && PB_PIXFMT=""
+  [ "$PB_PRIM"   = "N/A" ] && PB_PRIM=""
+  [ "$PB_TRC"    = "N/A" ] && PB_TRC=""
+  [ "$PB_FPSR"   = "N/A" ] && PB_FPSR=""
+  [ "$PB_DUR"    = "N/A" ] && PB_DUR=""
+}
 # Do the audio tracks we are actually KEEPING include a TV-friendly codec?
 # Deliberately scoped to the kept set rather than the whole file: a source can own a
 # compatible track that the keep rules discard, and in that case the output still
@@ -301,7 +331,9 @@ process(){
   # Retry cap: a file that has failed MAX_FAILS times will keep failing (bad source,
   # unsupported format, ...). Re-encoding it every pass burns GPU time for nothing.
   # Clear its lines from state/failed.list to force a retry after a config/ffmpeg change.
-  local _nfail; _nfail=$(grep -cxF "$src" "$FAIL_LIST" 2>/dev/null || echo 0)
+  # NB grep -c PRINTS a count and EXITS 1 when the count is zero, so a `|| echo 0`
+  # fallback appends a second line and yields "0\n0". Take the first line instead.
+  local _nfail; _nfail=$(grep -cxF -- "$src" "$FAIL_LIST" 2>/dev/null | head -n1); _nfail="${_nfail:-0}"
   if [ "${_nfail:-0}" -ge "$MAX_FAILS" ]; then
     plan SKIP "failed ${_nfail}x (capped)" "$size" "$src"
     log "SKIP(failed ${_nfail}x >= MAX_FAILS=$MAX_FAILS): $(basename "$src")"
@@ -314,14 +346,13 @@ process(){
 
   # --- classify: probe and decide WHY (if at all) this file should be processed ---
   local w hgt od
-  w=$(ffprobe -v error -select_streams v:0 -show_entries stream=width  -of csv=p=0 "$src" 2>/dev/null | head -n1 | tr -dc '0-9')
-  hgt=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$src" 2>/dev/null | head -n1 | tr -dc '0-9')
-  od=$(dur_of "$src")
+  probe_src "$src"                 # single ffprobe: w/h/codec/pix_fmt/colour/fps/duration
+  w="$PB_W"; hgt="$PB_H"; od="$PB_DUR"
   [ -z "$w" ] && { plan SKIP "no video" "$size" "$src"; log "SKIP(no video): $base"; return 0; }
   local tinfo tier qval min_mbps; tinfo="$(tier_of "${w:-0}")"
   [ -z "$tinfo" ] && { plan SKIP "no resolution (${w}px)" "$size" "$src"; log "SKIP(no res w=$w): $base"; return 0; }
   read -r tier qval min_mbps <<<"$tinfo"
-  local vcod; vcod="$(vcodec_of "$src")"
+  local vcod; vcod="$PB_VCODEC"
 
   # TV cap: shows are never kept at 4K -> downscale to 1080p (movies unaffected).
   # A 4K episode is retiered to 1080p (Q_1080), and a scale target height is computed
@@ -397,9 +428,7 @@ process(){
     # NOTE: default=nk=1 (not csv) — ffprobe's csv writer appends a stray trailing
     # comma on some files, which silently broke HDR/10-bit detection (encoding HDR as
     # 8-bit SDR). default:nk=1 returns the bare value with no separator.
-    pixfmt=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)
-    prim_c=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_primaries -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)
-    trc=$(ffprobe    -v error -select_streams v:0 -show_entries stream=color_transfer  -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)
+    pixfmt="$PB_PIXFMT"; prim_c="$PB_PRIM"; trc="$PB_TRC"
     { [ "$trc" = "smpte2084" ] || [ "$trc" = "arib-std-b67" ] || [ "$prim_c" = "bt2020" ]; } && ishdr=1
     case "$pixfmt" in *10le|*10be|p010*) is10=1 ;; esac
     [ "$ishdr" = 1 ] && is10=1
@@ -437,7 +466,7 @@ process(){
   # Include the source frame rate: some encodes report out_time=N/A via -progress,
   # so the dashboard needs frame/total_frames as a fallback for percent complete.
   local _fpsr _fps _tframes
-  _fpsr="$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)"
+  _fpsr="$PB_FPSR"
   _fps="$(awk -F/ 'NF==2 && $2>0 {printf "%.6f", $1/$2; exit} NF==1 {print $1; exit}' <<<"${_fpsr:-0}")"
   _tframes="$(awk -v d="${od:-0}" -v f="${_fps:-0}" 'BEGIN{printf "%d", (d>0&&f>0)? d*f : 0}')"
   printf '{"src":"%s","base":"%s","size":%s,"duration":%s,"width":%s,"tier":"%s","quality":"%s","fps_src":%s,"total_frames":%s,"start":%s}\n' \
