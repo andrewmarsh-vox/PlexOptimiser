@@ -42,7 +42,12 @@ MUSIC_TARGET_KBPS="${MUSIC_TARGET_KBPS:-320}"
 # running): 1 job = 5221ms/track, 2 = 3502ms (1.49x), 3 = 3396ms, 4 = 3132ms.
 # Nearly all the win is in the first extra job, so 2 is the default - higher
 # values mostly add IO contention and steal cores from Plex.
-MUSIC_JOBS="${MUSIC_JOBS:-2}"
+# Ceiling on parallel encoders. Because niced time counts as reclaimable headroom,
+# the governor will ramp to this whenever nothing at normal priority is competing -
+# so the ceiling, not the step logic, is the real control. Default to cores-1 to
+# leave one core for Plex, the OS and the video encoder's CPU side.
+MUSIC_JOBS="${MUSIC_JOBS:-$(( $(nproc 2>/dev/null || echo 2) - 1 ))}"
+[ "$MUSIC_JOBS" -lt 1 ] && MUSIC_JOBS=1
 
 INCOMPAT="ape wmav1 wmav2 wmalossless wmapro tak tta wavpack musepack mpc als shorten optimfrog"
 LOSSLESS="flac alac ape wavpack tak tta wmalossless shorten optimfrog pcm_s16le pcm_s24le pcm_s32le"
@@ -62,6 +67,45 @@ _music_cleanup(){
 trap _music_cleanup INT TERM HUP
 acodec(){ ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$1" 2>/dev/null | head -n1 | tr -d ' '; }
 dur(){ ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$1" 2>/dev/null | cut -d. -f1; }
+
+# Converting a file replaces track.flac with track.mp3 and deletes the original, so
+# every library that indexed the old path now points at a file that is gone. Lidarr
+# keeps reporting the stale .flac and its "what I have" counts drift; Plex shows the
+# track as missing until it rescans. Both must be told.
+LIDARR_URL="${LIDARR_URL:-http://127.0.0.1:8686}"
+LIDARR_CFG="${LIDARR_CFG:-/root/media-stack/config/lidarr/config.xml}"
+LIDARR_KEY="${LIDARR_KEY:-$(grep -oP '(?<=<ApiKey>)[^<]+' "$LIDARR_CFG" 2>/dev/null)}"
+PLEX_URL="${PLEX_URL:-http://127.0.0.1:32400}"
+PLEX_SECRETS="${PLEX_SECRETS:-/root/media-stack/homeassistant/secrets.yaml}"
+PLEX_TOKEN="${PLEX_TOKEN:-$(grep -oP 'plex_token:\s*\K\S+' "$PLEX_SECRETS" 2>/dev/null)}"
+NOTIFY_PENDING=0
+
+# Rescan is expensive, so we do not fire per file: mark dirty and flush once the
+# pass ends (or every NOTIFY_EVERY conversions for long runs).
+NOTIFY_EVERY="${NOTIFY_EVERY:-200}"
+notify_mark(){ NOTIFY_PENDING=$((NOTIFY_PENDING+1)); }
+notify_flush(){
+  [ "$NOTIFY_PENDING" -gt 0 ] || return 0
+  if [ -n "$LIDARR_KEY" ]; then
+    if curl -sf -m 10 -X POST -H "X-Api-Key: $LIDARR_KEY" -H 'Content-Type: application/json' \
+         "$LIDARR_URL/api/v1/command" -d '{"name":"RescanFolders"}' -o /dev/null 2>/dev/null; then
+      log "lidarr: RescanFolders queued after $NOTIFY_PENDING conversion(s)"
+    else
+      log "lidarr: rescan request failed (non-fatal)"
+    fi
+  else
+    log "lidarr: no API key found, rescan skipped"
+  fi
+  if [ -n "$PLEX_TOKEN" ]; then
+    local sect
+    sect=$(curl -sf -m 10 "$PLEX_URL/library/sections?X-Plex-Token=$PLEX_TOKEN" 2>/dev/null \
+           | grep -oP '<Directory[^>]*type="artist"[^>]*key="\K[0-9]+' | head -n1)
+    if [ -n "$sect" ] && curl -sf -m 10 "$PLEX_URL/library/sections/$sect/refresh?X-Plex-Token=$PLEX_TOKEN" -o /dev/null 2>/dev/null; then
+      log "plex: music section $sect refresh queued"
+    fi
+  fi
+  NOTIFY_PENDING=0
+}
 
 # Never touch anything under an excluded root (irreplaceable personal media).
 excluded(){
@@ -128,6 +172,7 @@ done < <(find -L "$ROOT" -type f \( -iname '*.ape' -o -iname '*.wma' -o -iname '
          -o -iname '*.tak' -o -iname '*.tta' -o -iname '*.mpc' -o -iname '*.als' \
          -o -iname '*.shn' -o -iname '*.ofr' \) -print0 2>/dev/null)
 log "compatibility: $conv file(s) converted"
+[ "$conv" -gt 0 ] && { NOTIFY_PENDING=$conv; notify_flush; }
 
 # ---- 2) queue anything BETTER than target into the optimiser's own plan -----
 # We do not keep a separate music work list: candidates are appended to state/plan.tsv
@@ -160,24 +205,125 @@ log "queued: $queued file(s) added to optimiser plan ($PLAN_TSV)"
 # How many encodes to run at once, given what else the box is doing right now.
 # Audio is CPU-only (no GPU audio codec exists), so it competes with Plex
 # TRANSCODES and with ffmpeg's CPU side - never with the VAAPI video encode.
-audio_jobs_now(){
-  local want="$MUSIC_JOBS" cores load1 tx
-  cores=$(nproc 2>/dev/null || echo 2)
-  [ "$want" -gt "$cores" ] && want="$cores"
-  # A Plex transcode gets priority: drop to a single encoder.
-  tx=$(curl -sf -m3 "http://127.0.0.1:32400/status/sessions?X-Plex-Token=${PLEX_TOKEN:-}" 2>/dev/null \
-       | grep -o '<TranscodeSession' | wc -l)
-  [ "${tx:-0}" -gt 0 ] && { echo 1; return; }
-  # Already loaded beyond core count -> do not pile on.
-  load1=$(awk '{printf "%d", $1}' /proc/loadavg 2>/dev/null || echo 0)
-  [ "${load1:-0}" -ge "$cores" ] && { echo 1; return; }
-  echo "$want"
+# Closed-loop parallelism, in the same spirit as the GPU governor: measure, then
+# step ONE job up if there is headroom or one down if there is not, rather than
+# flipping between 1 and max.
+#
+# loadavg is the wrong signal here. It counts uninterruptible (D-state) IO waiters,
+# and this box sits around 45% iowait while the video encoder copies output to the
+# array - loadavg reads >4 on 4 cores while the CPU is largely idle. We sample
+# /proc/stat for real idle/iowait instead.
+AUDIO_JOBS_CUR=1
+AUDIO_LAST_EVAL=0
+AUDIO_EVAL_SEC="${AUDIO_EVAL_SEC:-15}"      # re-measure at most this often
+AUDIO_IDLE_UP="${AUDIO_IDLE_UP:-25}"        # idle% above which we add an encoder
+AUDIO_IDLE_DOWN="${AUDIO_IDLE_DOWN:-10}"    # idle% below which we drop one
+AUDIO_IOWAIT_CEIL="${AUDIO_IOWAIT_CEIL:-55}" # iowait% above which more jobs cannot help
+
+cpu_sample(){   # -> "idle_pct iowait_pct" sampled over $1 seconds
+  local s1 s2
+  s1=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5, $6}' /proc/stat 2>/dev/null)
+  sleep "${1:-1}"
+  s2=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5, $6}' /proc/stat 2>/dev/null)
+  awk -v a="$s1" -v b="$s2" 'BEGIN{
+    split(a,x," "); split(b,y," ");
+    dt = y[1]-x[1];
+    if (dt <= 0) { print "0 100"; exit }
+    printf "%d %d", (y[2]-x[2])*100/dt, (y[3]-x[3])*100/dt
+  }'
 }
+
+# Share of CPU spent on NICED work over $1 seconds. This is load we can preempt:
+# our own encoders run at nice 15-19, so it is headroom, not contention.
+cpu_nice_pct(){
+  local s1 s2
+  s1=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $3}' /proc/stat 2>/dev/null)
+  sleep "${1:-1}"
+  s2=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $3}' /proc/stat 2>/dev/null)
+  awk -v a="$s1" -v b="$s2" 'BEGIN{
+    split(a,x," "); split(b,y," ");
+    dt=y[1]-x[1]; if(dt<=0){print 0; exit}
+    printf "%d", (y[2]-x[2])*100/dt
+  }'
+}
+
+# Only a VIDEO transcode really costs us; an audio-only or direct-play session does
+# not. This matches how ruby-governor.sh counts Plex load.
+plex_video_transcodes(){
+  local x
+  x=$(curl -sf -m3 "$PLEX_URL/status/sessions?X-Plex-Token=${PLEX_TOKEN:-}" 2>/dev/null) || { echo 0; return; }
+  local n
+  n=$(grep -oE '<TranscodeSession [^>]*' <<<"$x" | grep -c 'videoDecision="transcode"' 2>/dev/null | head -n1)
+  echo "${n:-0}"
+}
+
+audio_jobs_now(){
+  local now cores idle iow tx cur max
+  now=$(date +%s)
+  # Sampling costs a second; at ~3.5s per track that would be ~30% overhead if we
+  # measured on every slot. Re-use the last decision inside the eval window.
+  if [ $(( now - AUDIO_LAST_EVAL )) -lt "$AUDIO_EVAL_SEC" ]; then
+    echo "$AUDIO_JOBS_CUR"; return
+  fi
+  AUDIO_LAST_EVAL="$now"
+  cores=$(nproc 2>/dev/null || echo 2)
+  max="$MUSIC_JOBS"; [ "$max" -gt "$cores" ] && max="$cores"; [ "$max" -lt 1 ] && max=1
+  cur="$AUDIO_JOBS_CUR"; [ "$cur" -lt 1 ] && cur=1
+  tx=$(plex_video_transcodes)
+  if [ "${tx:-0}" -gt 0 ]; then
+    [ "$cur" -ne 1 ] && log "audio governor: plex transcoding -> 1 encoder (was $cur)" >&2
+    AUDIO_JOBS_CUR=1; echo 1; return
+  fi
+  read -r idle iow <<<"$(cpu_sample 1)"
+  # Raw idle is the wrong yardstick on this box. Almost all load here is OUR OWN
+  # niced work (nice=69% in a typical sample: the audio encoder at nice 19 and the
+  # video encoder's CPU side), which yields instantly to anything at normal priority.
+  # Counting it as "no headroom" means we throttle ourselves because we are busy.
+  # Treat nice time as reclaimable, like ruby-governor.sh throttles against Plex
+  # rather than against total GPU use.
+  local nice_pct effective_idle
+  nice_pct=$(cpu_nice_pct)
+  effective_idle=$(( ${idle:-0} + ${nice_pct:-0} ))
+  [ "$effective_idle" -gt 100 ] && effective_idle=100
+  local before="$cur"
+  idle="$effective_idle"
+  if [ "${iow:-0}" -ge "$AUDIO_IOWAIT_CEIL" ]; then
+    [ "$cur" -gt 1 ] && cur=$(( cur - 1 ))        # disk-bound: more encoders just queue
+  elif [ "${idle:-0}" -ge "$AUDIO_IDLE_UP" ]; then
+    [ "$cur" -lt "$max" ] && cur=$(( cur + 1 ))   # headroom: ramp up a step
+  elif [ "${idle:-0}" -le "$AUDIO_IDLE_DOWN" ]; then
+    [ "$cur" -gt 1 ] && cur=$(( cur - 1 ))        # saturated: back off a step
+  fi
+  if [ "$cur" != "$before" ]; then
+    log "audio governor: idle=${idle}% iowait=${iow}% -> $cur encoder(s) (was $before, max $max)" >&2
+  fi
+  AUDIO_JOBS_CUR="$cur"
+  printf '{"jobs":%s,"max":%s,"idle":%s,"nice":%s,"iowait":%s,"plex_tx":%s,"ts":%s}\n' \
+    "$cur" "$max" "${idle:-0}" "${nice_pct:-0}" "${iow:-0}" "${tx:-0}" "$now" > "$STATE/audio-governor.json" 2>/dev/null
+  echo "$cur"
+}
+
 
 down=0; saved=0
 if [ "$MUSIC_DOWNCONVERT" = 1 ] && [ "$DRY" = 0 ]; then
   PLEX_TOKEN="${PLEX_TOKEN:-$(grep -oP 'plex_token:\s*\K\S+' /root/media-stack/homeassistant/secrets.yaml 2>/dev/null)}"
-  JOBS=$(audio_jobs_now)
+  # HARD SAFETY: a non-integer here makes `[ n -ge $JOBS ]` error, the pool guard
+  # never blocks, and every queue row spawns an encoder - a fork bomb (this happened:
+  # load hit 227 when a log line leaked into the captured value). Never trust the
+  # governor's output; clamp it to a sane integer before it is used as a limit.
+  AUDIO_HARD_MAX="${AUDIO_HARD_MAX:-$(nproc 2>/dev/null || echo 4)}"
+  sane_jobs(){  # $1=candidate -> a clamped integer on stdout, never empty
+    local v="${1:-}"
+    case "$v" in (''|*[!0-9]*) v=1 ;; esac
+    [ "$v" -lt 1 ] && v=1
+    [ "$v" -gt "$AUDIO_HARD_MAX" ] && v="$AUDIO_HARD_MAX"
+    printf '%s' "$v"
+  }
+  # audio_jobs_now() must be called DIRECTLY, not via $(...): a command substitution
+  # runs it in a subshell, so AUDIO_JOBS_CUR never propagates back and the governor
+  # restarts from 1 on every call - it could step to 2 and never any higher.
+  audio_jobs_now >/dev/null 2>&1
+  JOBS=$(sane_jobs "$AUDIO_JOBS_CUR")
   RESULTS="$STATE/.music-results.$$"; : > "$RESULTS"
   log "downconvert: starting with $JOBS parallel encoder(s) (MUSIC_JOBS=$MUSIC_JOBS, $(nproc) cores)"
   while IFS=$'\t' read -r d det sz p; do
@@ -195,7 +341,12 @@ if [ "$MUSIC_DOWNCONVERT" = 1 ] && [ "$DRY" = 0 ]; then
     # Keep the pool full, and re-evaluate headroom as conditions change.
     while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do
       wait -n 2>/dev/null || break
-      JOBS=$(audio_jobs_now)
+      audio_jobs_now >/dev/null 2>&1
+      JOBS=$(sane_jobs "$AUDIO_JOBS_CUR")
+    done
+    # Belt and braces: if the guard above ever fails to block, do not run away.
+    while [ "$(jobs -rp | wc -l)" -ge "$AUDIO_HARD_MAX" ]; do
+      wait -n 2>/dev/null || break
     done
   done < "$PLAN_TSV"
   wait
@@ -205,6 +356,8 @@ if [ "$MUSIC_DOWNCONVERT" = 1 ] && [ "$DRY" = 0 ]; then
   fi
   rm -f "$RESULTS"
   log "downconvert: $down file(s) -> mp3-${MUSIC_TARGET_KBPS}, reclaimed $((saved/1000000))MB"
+  # Tell Lidarr/Plex the files changed underneath them.
+  [ "$down" -gt 0 ] && { NOTIFY_PENDING=$down; notify_flush; }
 else
   log "downconvert: not running (MUSIC_DOWNCONVERT=${MUSIC_DOWNCONVERT}, dry=$DRY) - items stay queued"
 fi

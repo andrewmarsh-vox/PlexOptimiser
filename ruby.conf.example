@@ -24,8 +24,13 @@ MAX_FAILS=3
 # --- music (ruby-music.sh) ---------------------------------------------------
 # House target for audio. MP3-320 is transparent for playback and always direct-plays.
 MUSIC_TARGET_KBPS=320
-# Parallel audio encoders (auto-drops to 1 under Plex transcode or high load).
-MUSIC_JOBS=2
+# CEILING for parallel audio encoders; the governor ramps between 1 and this based
+# on measured CPU idle/iowait, and drops to 1 while Plex is transcoding video.
+MUSIC_JOBS=3
+#AUDIO_IDLE_UP=25
+#AUDIO_IDLE_DOWN=10
+#AUDIO_IOWAIT_CEIL=55
+#AUDIO_EVAL_SEC=15
 # 1 = also downconvert files BETTER than the target (FLAC/ALAC/24bit -> MP3-320).
 # LOSSY AND IRREVERSIBLE: the lossless original is deleted after verification.
 MUSIC_DOWNCONVERT=0
