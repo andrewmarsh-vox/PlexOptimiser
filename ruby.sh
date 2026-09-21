@@ -57,6 +57,9 @@ MIN_FREE_GB="${MIN_FREE_GB:-30}" # require this much free on dest drive before r
 # --- compatibility pass (avoid client transcoding, NOT resolution-related) ---
 Q_720="${Q_720:-22}"             # quality for sub-1080p compatibility re-encodes (resolution preserved)
 SCAN_MIN_MB="${SCAN_MIN_MB:-500}"  # find floor (MB): probe any file >= this. 500MB catches real TV episodes + movies while skipping tiny samples/featurettes/extras. Set lower (e.g. 1) to check literally everything.
+# Library roots Ruby must NEVER touch (irreplaceable media). Prefix match, so listing a
+# directory excludes everything beneath it. Paths may contain spaces -> keep it an array.
+[ -v EXCLUDE_ROOTS ] || EXCLUDE_ROOTS=()
 # Video codecs modern TVs/tablets can't direct-play -> always force to HEVC (any size/bitrate).
 BAD_VIDEO="${BAD_VIDEO:-vc1 mpeg2video av1 mpeg4 msmpeg4v3 wmv3 vp6f vp6 rv40}"
 # Audio codecs that direct-play on TVs/tablets; if a file has NONE of these we add compatible tracks.
@@ -78,13 +81,29 @@ export LIBVA_DRIVER_NAME=iHD
 
 mkdir -p "$SCRATCH" "$STATE_DIR" "$(dirname "$LOG")"
 DONE_LIST="$STATE_DIR/done.list"; FAIL_LIST="$STATE_DIR/failed.list"
+MAX_FAILS="${MAX_FAILS:-3}"   # give up on a file after this many failed attempts
+FAIL_TSV="$STATE_DIR/failed.tsv"   # ts<TAB>reason<TAB>path - so the dashboard can show WHY
 # Durable per-file conversion stats (append-only, never regenerated): each DONE
 # appends ts<TAB>mode<TAB>orig_bytes<TAB>new_bytes<TAB>delta_bytes<TAB>dest. The
 # original size is knowable ONLY here (the source is deleted right after), and this
 # survives plan.tsv rescans + log rotation — so all-time savings stay exact.
 STATS_TSV="$STATE_DIR/converted.tsv"
-touch "$DONE_LIST" "$FAIL_LIST" "$STATS_TSV"
+touch "$DONE_LIST" "$FAIL_LIST" "$STATS_TSV" "$FAIL_TSV"
 log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+# Clean shutdown: systemd stop / Ctrl-C must not leave stale telemetry (the dashboard
+# would keep showing a phantom "now encoding") or a half-written scratch file.
+# NOTE: files already staged in state/pending/ are deliberately LEFT for
+# recover_pending() — they are verified replacements whose original is already gone.
+RUBY_CURRENT_WORK=""
+_ruby_cleanup(){
+  local rc=$?
+  [ -n "${RUBY_CURRENT_WORK:-}" ] && rm -f "$RUBY_CURRENT_WORK" 2>/dev/null
+  rm -f "$STATE_DIR/current.json" 2>/dev/null
+  log "interrupted (signal/exit rc=$rc) - telemetry cleared"
+  exit $rc
+}
+trap _ruby_cleanup INT TERM HUP
 human(){ numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1}B"; }
 dur_of(){ ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$1" 2>/dev/null | cut -d. -f1; }
 
@@ -145,6 +164,23 @@ is_show_path(){
   return 1
 }
 
+# True when a path sits under an EXCLUDE_ROOTS entry (see config). Checked both at
+# library discovery and per file, so an explicitly-passed file is covered too.
+is_excluded(){
+  # Compare CANONICAL paths. /mnt/homevideos is a symlink to the real library dir, so a
+  # literal prefix test lets `ruby.sh /mnt/homevideos/clip.mkv` slip past an exclusion
+  # that names the real path. Originals are deleted on replace, so this must not leak.
+  local p="$1" e rp re
+  rp="$(readlink -f -- "$p" 2>/dev/null || echo "$p")"
+  for e in "${EXCLUDE_ROOTS[@]}"; do
+    [ -n "$e" ] || continue
+    re="$(readlink -f -- "$e" 2>/dev/null || echo "$e")"
+    case "$p"  in "$e"|"$e"/*)   return 0;; esac
+    case "$rp" in "$re"|"$re"/*) return 0;; esac
+  done
+  return 1
+}
+
 # Robustly read "<index> <lang>" lines for streams of a given type (a or s).
 # lang is empty string when the stream has no language tag (common in raw m2ts).
 _streams(){  # $1=file $2=a|s
@@ -158,21 +194,63 @@ _streams(){  # $1=file $2=a|s
     done | awk '!seen[$1]++'   # dedupe: m2ts lists streams once per BDAV program
 }
 
-# audio to keep (echo space-separated SOURCE stream indices): the primary (first)
-# track, plus the first English track only if the primary isn't English (covers
-# foreign films: original + English). Max 2.
+# Like _streams but for audio only, and it also carries the codec:
+# "<index> <lang> <codec>". lang is "und" when the stream has no language tag.
+_astreams(){  # $1=file
+  ffprobe -v error -select_streams a \
+    -show_entries stream=index,codec_name:stream_tags=language -of compact=p=0:nk=0 "$1" 2>/dev/null \
+  | while IFS= read -r line; do
+      local idx lang cod
+      idx="$(sed -n 's/.*\bindex=\([0-9]\+\).*/\1/p' <<<"$line")"
+      cod="$(sed -n 's/.*\bcodec_name=\([A-Za-z0-9_]\+\).*/\1/p' <<<"$line")"
+      lang="$(sed -n 's/.*language=\([A-Za-z]\+\).*/\1/p' <<<"$line")"
+      [ -n "$idx" ] && printf '%s %s %s\n' "$idx" "${lang:-und}" "${cod:-unknown}"
+    done | awk '!seen[$1]++'   # dedupe: m2ts lists streams once per BDAV program
+}
+
+# audio to keep (echo space-separated SOURCE stream indices):
+#   1. the primary (first) track — usually the lossless one;
+#   2. the first English track, only if the primary isn't English (foreign films);
+#   3. the first already-direct-play-compatible track, if 1+2 didn't already catch one.
+#
+# Rule 3 matters more than it looks. A typical remux is "DTS-HD MA primary + AC3
+# companion": has_good_audio() saw the AC3 and correctly decided no tracks needed
+# ADDING, but the keep list was primary-only, so the AC3 was silently DROPPED. The
+# output then had lossless-only audio and every TV had to transcode it — the exact
+# opposite of what this tool exists to do. Keeping the compatible track costs ~640kbps
+# and preserves direct play for free.
 audio_keep_idxs(){
-  local f="$1"; mapfile -t rows < <(_streams "$f" a)
+  local f="$1"; mapfile -t rows < <(_astreams "$f")
   [ ${#rows[@]} -eq 0 ] && return 1
-  local first_idx="${rows[0]%% *}" first_lang="${rows[0]#* }"
-  printf '%s' "$first_idx"
+  local r idx lang cod g out="" first_lang
+  read -r idx first_lang cod <<<"${rows[0]}"
+  out="$idx"
   if [ "$first_lang" != "eng" ]; then
-    local r idx lang
-    for r in "${rows[@]:1}"; do idx="${r%% *}"; lang="${r#* }"
-      if [ "$lang" = "eng" ]; then printf ' %s' "$idx"; break; fi
+    for r in "${rows[@]:1}"; do read -r idx lang cod <<<"$r"
+      [ "$lang" = "eng" ] && { out="$out $idx"; break; }
     done
   fi
-  printf '\n'
+  # do the kept tracks already include a TV-friendly codec?
+  local havegood=0 i
+  for i in $out; do
+    for r in "${rows[@]}"; do read -r idx lang cod <<<"$r"
+      [ "$idx" = "$i" ] || continue
+      for g in $GOOD_AUDIO; do [ "$cod" = "$g" ] && havegood=1; done
+    done
+  done
+  # if not, adopt one that already exists — preferring a language we're keeping.
+  if [ "$havegood" = 0 ]; then
+    local want
+    for want in eng any; do
+      for r in "${rows[@]}"; do read -r idx lang cod <<<"$r"
+        [ "$want" = eng ] && [ "$lang" != eng ] && [ "$lang" != "$first_lang" ] && continue
+        for g in $GOOD_AUDIO; do
+          [ "$cod" = "$g" ] && { out="$out $idx"; havegood=1; break 3; }
+        done
+      done
+    done
+  fi
+  printf '%s\n' "$out"
 }
 # subs to keep (echo space-separated indices): all English-tagged; if NONE tagged
 # eng (untagged m2ts), keep all subs.
@@ -190,26 +268,49 @@ sub_keep_idxs(){
 
 # first video stream codec name (tr strips any stray csv trailing comma/space)
 vcodec_of(){ ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$1" 2>/dev/null | head -n1 | tr -d ', \t'; }
-# does the file already carry at least one TV-friendly audio codec?
-has_good_audio(){
-  local f="$1" c g
-  while IFS= read -r c; do
-    c="${c%%,*}"   # guard against stray csv trailing comma
+# Do the audio tracks we are actually KEEPING include a TV-friendly codec?
+# Deliberately scoped to the kept set rather than the whole file: a source can own a
+# compatible track that the keep rules discard, and in that case the output still
+# needs one added. (Asking the file-wide question here is what let files come out
+# lossless-only — see audio_keep_idxs.)
+kept_has_good_audio(){  # $1=file  $2=space-separated kept stream indices
+  local f="$1" idxs="$2" i c g
+  for i in $idxs; do
+    c=$(ffprobe -v error -select_streams "$i" -show_entries stream=codec_name \
+          -of default=nw=1:nk=1 "$f" 2>/dev/null | head -n1 | tr -d ', \t')
     for g in $GOOD_AUDIO; do [ "$c" = "$g" ] && return 0; done
-  done < <(ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null)
+  done
   return 1
 }
 
 # emit a plan line (decision<TAB>detail<TAB>bytes<TAB>path) when PLAN_OUT is set
+# Record a failure WITH a reason. failed.list stays (resume/compat); failed.tsv adds
+# the reason so the dashboard can group failures instead of printing "see log".
+record_fail(){  # $1=src  $2=reason
+  echo "$1" >> "$FAIL_LIST"
+  printf '%s\t%s\t%s\n' "$(date +%s)" "${2//$'\t'/ }" "$1" >> "$FAIL_TSV"
+}
+
 plan(){ [ -n "${PLAN_OUT:-}" ] && printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$PLAN_OUT"; }
 
 process(){
   local src="$1"
+  is_excluded "$src" && { log "SKIP(excluded): $(basename "$src")"; return 0; }
   local size; size=$(stat -c%s "$src" 2>/dev/null || echo 0)
   grep -qxF "$src" "$DONE_LIST" && { plan DONE done "$size" "$src"; log "SKIP(done): $(basename "$src")"; return 0; }
+  # Retry cap: a file that has failed MAX_FAILS times will keep failing (bad source,
+  # unsupported format, ...). Re-encoding it every pass burns GPU time for nothing.
+  # Clear its lines from state/failed.list to force a retry after a config/ffmpeg change.
+  local _nfail; _nfail=$(grep -cxF "$src" "$FAIL_LIST" 2>/dev/null || echo 0)
+  if [ "${_nfail:-0}" -ge "$MAX_FAILS" ]; then
+    plan SKIP "failed ${_nfail}x (capped)" "$size" "$src"
+    log "SKIP(failed ${_nfail}x >= MAX_FAILS=$MAX_FAILS): $(basename "$src")"
+    return 0
+  fi
   local base dir stem; base="$(basename "$src")"
   dir="$(dirname "$src")"; stem="${base%.*}"
   local work="$SCRATCH/${stem}.hevc.mkv" dest="$dir/${stem}.mkv"
+  RUBY_CURRENT_WORK="$work"
 
   # --- classify: probe and decide WHY (if at all) this file should be processed ---
   local w hgt od
@@ -232,10 +333,17 @@ process(){
     th=$(( (w>0 && hgt>0) ? (hgt*tw + w/2)/w : 1080 )); th=$(( (th/2)*2 ))
   fi
 
+  # Decide which audio survives BEFORE deciding why we're touching the file: whether
+  # compatible audio must be ADDED depends on what we're keeping, not on what the
+  # source merely contains. (These two questions used to disagree — the source could
+  # own an AC3 track that satisfied the check and was then dropped by the keep rules.)
+  local keepidx; keepidx="$(audio_keep_idxs "$src")" || { plan SKIP "no audio" "$size" "$src"; log "FAIL(no audio): $base"; record_fail "$src" "no audio stream"; return 1; }
+  local keep; read -ra keep <<<"$keepidx"
+
   # Reasons to touch a file:
   #   shrink   = large high-bitrate remux (original behaviour)       -> HEVC re-encode, smaller
   #   vcodec   = client-incompatible video codec (vc1/mpeg2/av1/...) -> HEVC re-encode, resolution kept
-  #   audio    = no TV-friendly audio codec present                  -> add AC3/AAC tracks
+  #   audio    = no TV-friendly audio codec among the KEPT tracks    -> add AC3/AAC tracks
   #   cap1080  = 4K show being downscaled to 1080p                   -> HEVC re-encode at 1080p
   local reason_shrink=0 reason_vcodec=0 reason_audio=0 mbps=0 b
   if [ "$size" -ge $((MIN_SIZE_GB*1000000000)) ] && [ "${od:-0}" -gt 0 ]; then
@@ -243,7 +351,7 @@ process(){
     [ "$mbps" -ge "$min_mbps" ] && reason_shrink=1
   fi
   for b in $BAD_VIDEO; do [ "$vcod" = "$b" ] && { reason_vcodec=1; break; }; done
-  has_good_audio "$src" || reason_audio=1
+  kept_has_good_audio "$src" "$keepidx" || reason_audio=1
 
   local mode why=""
   [ "$cap1080" = 1 ]      && why="downscale4K->1080p"
@@ -257,9 +365,7 @@ process(){
     log "SKIP(ok ${tier} ${vcod} ${mbps}Mbps): $base"; return 0
   fi
 
-  # --- audio: keep lossless primary(+English); add compatible tracks if none exist ---
-  local keepidx; keepidx="$(audio_keep_idxs "$src")" || { plan SKIP "no audio" "$size" "$src"; log "FAIL(no audio): $base"; echo "$src">>"$FAIL_LIST"; return 1; }
-  local keep; read -ra keep <<<"$keepidx"
+  # --- audio: keep list settled above; add compatible tracks if none survived ---
   local prim="${keep[0]}" primlang primch
   primlang=$(ffprobe -v error -select_streams a:0 -show_entries stream_tags=language -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1 | tr -dc 'A-Za-z'); [ -n "$primlang" ] || primlang=eng
   primch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1 | tr -dc '0-9'); [ "${primch:-0}" -ge 1 ] 2>/dev/null || primch=2
@@ -302,7 +408,13 @@ process(){
     local scale=""; [ "$cap1080" = 1 ] && scale="scale_vaapi=w=${tw}:h=${th}"
     if [ "$is10" = 1 ]; then
       prof=main10; rc=(-rc_mode ICQ -global_quality "$qval"); qlabel="ICQ$qval"
-      [ -n "$scale" ] && vf=(-vf "$scale")
+      # The filter chain MUST declare the surface format, exactly like the 8-bit path.
+      # Without it ffmpeg inserts auto_scale between the VAAPI decode surface and
+      # hevc_vaapi, which cannot convert hw formats:
+      #   "Impossible to convert between the formats supported by 'Parsed_null_0'
+      #    and 'auto_scale_0'" -> -38 -> "Could not open encoder" -> -22.
+      # That accounted for 112 of 140 historical failures (all 10-bit/HDR sources).
+      if [ -n "$scale" ]; then vf=(-vf "${scale}:format=p010"); else vf=(-vf scale_vaapi=format=p010); fi
     else
       prof=main; rc=(-rc_mode CQP -qp "$qval"); qlabel="QP$qval"
       if [ -n "$scale" ]; then vf=(-vf "${scale}:format=nv12"); else vf=(-vf scale_vaapi=format=nv12); fi
@@ -321,9 +433,15 @@ process(){
   log "START($mode): $base [$tier $qlabel ${prof:-copy}] ($(human "$size")) why[$why] keepA[${keep[*]}] keepS[$subidx]"
   { [ "$DRY_RUN" = "1" ] || [ -n "${PLAN_OUT:-}" ]; } && { log "DRY_RUN only"; return 0; }
 
-  # publish current-conversion telemetry for the dashboard
-  printf '{"src":"%s","base":"%s","size":%s,"duration":%s,"width":%s,"tier":"%s","quality":"%s","start":%s}\n' \
-    "${src//\"/}" "${base//\"/}" "$size" "${od:-0}" "${w:-0}" "$tier" "$qlabel" "$(date +%s)" > "$STATE_DIR/current.json"
+  # publish current-conversion telemetry for the dashboard.
+  # Include the source frame rate: some encodes report out_time=N/A via -progress,
+  # so the dashboard needs frame/total_frames as a fallback for percent complete.
+  local _fpsr _fps _tframes
+  _fpsr="$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nw=1:nk=1 "$src" 2>/dev/null | head -n1)"
+  _fps="$(awk -F/ 'NF==2 && $2>0 {printf "%.6f", $1/$2; exit} NF==1 {print $1; exit}' <<<"${_fpsr:-0}")"
+  _tframes="$(awk -v d="${od:-0}" -v f="${_fps:-0}" 'BEGIN{printf "%d", (d>0&&f>0)? d*f : 0}')"
+  printf '{"src":"%s","base":"%s","size":%s,"duration":%s,"width":%s,"tier":"%s","quality":"%s","fps_src":%s,"total_frames":%s,"start":%s}\n' \
+    "${src//\"/}" "${base//\"/}" "$size" "${od:-0}" "${w:-0}" "$tier" "$qlabel" "${_fps:-0}" "${_tframes:-0}" "$(date +%s)" > "$STATE_DIR/current.json"
   : > "$STATE_DIR/current.progress"
 
   rm -f "$work"
@@ -333,13 +451,13 @@ process(){
           -i "$src" -map 0:v:0 "${amap[@]}" "${smap[@]}" -map_chapters 0 "${vf[@]}" \
           -c:v hevc_vaapi "${rc[@]}" -profile:v "$prof" "${color[@]}" \
           "${acodec[@]}" -c:s copy "$work" 2>>"$LOG"; then
-      log "FAIL(ffmpeg): $base"; echo "$src">>"$FAIL_LIST"; rm -f "$work" "$STATE_DIR/current.json"; return 1
+      log "FAIL(ffmpeg): $base"; record_fail "$src" "ffmpeg:$mode"; rm -f "$work" "$STATE_DIR/current.json"; return 1
     fi
   else   # remux: video copied bit-for-bit, only the audio tracks are rebuilt (no quality loss)
     if ! nice -n 10 ffmpeg -nostdin -hide_banner -loglevel error -y -progress "$STATE_DIR/current.progress" \
           -i "$src" -map 0:v:0 "${amap[@]}" "${smap[@]}" -map_chapters 0 \
           -c:v copy "${acodec[@]}" -c:s copy "$work" 2>>"$LOG"; then
-      log "FAIL(ffmpeg): $base"; echo "$src">>"$FAIL_LIST"; rm -f "$work" "$STATE_DIR/current.json"; return 1
+      log "FAIL(ffmpeg): $base"; record_fail "$src" "verify:$mode newsize=$nsize vcodec=$nvc ddiff=${ddiff}s audio=$nac/$an"; rm -f "$work" "$STATE_DIR/current.json"; return 1
     fi
   fi
 
@@ -377,7 +495,7 @@ process(){
     # the original survives until the verified copy is renamed into place.
     local tmpdest="$dir/.${stem}.compressing.mkv"
     if ! cp -f "$work" "$tmpdest" || [ "$(stat -c%s "$tmpdest")" != "$nsize" ]; then
-      log "FAIL(copy): $base"; echo "$src">>"$FAIL_LIST"; rm -f "$work" "$tmpdest" "$STATE_DIR/current.json"; return 1
+      log "FAIL(copy): $base"; record_fail "$src" "copy: could not write beside original"; rm -f "$work" "$tmpdest" "$STATE_DIR/current.json"; return 1
     fi
     mv -f "$tmpdest" "$dest"
     [ "$src" != "$dest" ] && rm -f "$src"
@@ -401,7 +519,7 @@ process(){
     local PENDING="$STATE_DIR/pending"; mkdir -p "$PENDING"
     local pend="$PENDING/${stem}.mkv" pmeta="$PENDING/${stem}.meta"
     if ! mv -f "$work" "$pend"; then
-      log "FAIL(stage): $base"; echo "$src">>"$FAIL_LIST"; rm -f "$work" "$STATE_DIR/current.json"; return 1
+      log "FAIL(stage): $base"; record_fail "$src" "stage: could not move work file to pending/"; rm -f "$work" "$STATE_DIR/current.json"; return 1
     fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$src" "$dest" "$size" "$nsize" "$mode" > "$pmeta"
     log "TIGHT-SPACE(${freeg}G free < ${needg}G): staged verified copy, freeing original: $base"
@@ -417,6 +535,7 @@ process(){
     rm -f "$pend" "$pmeta"
   fi
   rm -f "$STATE_DIR/current.json"
+  RUBY_CURRENT_WORK=""
   echo "$dest">>"$DONE_LIST"
   local delta=$((size-nsize))
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$mode" "$size" "$nsize" "$delta" "$dest" >>"$STATS_TSV"
@@ -472,6 +591,7 @@ discover_libraries(){
     IFS=$'\t' read -r rp pp key typ <<<"$line"
     [ -n "$rp" ] || continue
     pathmap="${pathmap:+$pathmap }${rp}:${pp}:${key}"
+    if is_excluded "$rp"; then log "Ruby: library '${pp}' (section $key, $typ) -> EXCLUDED by EXCLUDE_ROOTS ($rp)"; continue; fi
     for t in $PLEX_LIB_TYPES; do
       if [ "$typ" = "$t" ] && [ -d "$rp" ]; then
         if [ "$typ" = show ]; then show_roots+=("$rp"); else other_roots+=("$rp"); fi

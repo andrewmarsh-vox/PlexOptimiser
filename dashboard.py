@@ -31,8 +31,11 @@ FAIL = os.path.join(STATE, "failed.list")
 # for original size + savings (survives plan.tsv rescans, which otherwise re-probe a
 # converted file at its now-compressed size and lose the original).
 CONVERTED = os.path.join(STATE, "converted.tsv")
+FAILED_TSV = os.path.join(STATE, "failed.tsv")
 LOG = os.path.join(BASE, "ruby.log")
 CUR_JSON = os.path.join(STATE, "current.json")
+CUR_MUSIC_JSON = os.path.join(STATE, "current-music.json")
+CUR_MUSIC_PROG = os.path.join(STATE, "current-music.progress")
 CUR_PROG = os.path.join(STATE, "current.progress")
 DRIVE = "/mnt/disks/16TBSeagate"
 PORT = 8800
@@ -229,6 +232,44 @@ def system_status():
 
 
 _music_cache = {"t": 0.0, "k": None, "v": {}}
+_fps_cache = {"k": None, "v": 0.0}
+def source_fps(path):
+    """Frame rate of a source file, cached. Used only when current.json lacks fps_src
+    (i.e. the encode was started by a ruby.sh older than the fps_src change)."""
+    if not path:
+        return 0.0
+    if _fps_cache["k"] == path:
+        return _fps_cache["v"]
+    val = 0.0
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate", "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        if out:
+            r = out[0].strip()
+            if "/" in r:
+                n, d = r.split("/", 1)
+                val = float(n) / float(d) if float(d) else 0.0
+            else:
+                val = float(r or 0)
+    except Exception:
+        val = 0.0
+    _fps_cache.update(k=path, v=val)
+    return val
+
+
+def fail_reasons():
+    """path -> most recent failure reason. Row: ts<TAB>reason<TAB>path."""
+    out = {}
+    for l in read_lines(FAILED_TSV):
+        p = l.split("\t")
+        if len(p) < 3:
+            continue
+        out["\t".join(p[2:])] = {"ts": p[0], "reason": p[1]}
+    return out
+
+
 def music_counts(root):
     """Count audio files in a music library (cached 30s)."""
     now = time.time()
@@ -529,6 +570,12 @@ def build_status():
     except (OSError, ValueError):
         cur = {}
     cur_src = cur.get("src", "")
+    fail_map = fail_reasons()
+    try:
+        with open(CUR_MUSIC_JSON) as _f: curm = json.load(_f)
+    except Exception:
+        curm = {}
+    cur_music_src = curm.get("src", "")
 
     # exact original sizes by path, from the plan
     plan_size = {}
@@ -555,10 +602,12 @@ def build_status():
     for decision, detail, size, path in plan_rows:
         base = os.path.basename(path)
         stem = base.rsplit(".", 1)[0]
-        dest = os.path.join(os.path.dirname(path), stem + ".mkv")
+        # audio rows (queued by ruby-music.sh) land as .mp3, video as .mkv
+        _ext = ".mp3" if detail.startswith("audio:") else ".mkv"
+        dest = os.path.join(os.path.dirname(path), stem + _ext)
         is_done = dest in done_set or path in done_set or decision == "DONE"
         is_fail = path in fail_set
-        is_cur = path == cur_src and not is_done
+        is_cur = path in (cur_src, cur_music_src) and path and not is_done
 
         row = {
             "name": base, "tier": tier_of(detail),
@@ -617,7 +666,8 @@ def build_status():
                     ratios.append(lg["new"] / lg["orig"])
         elif is_fail:
             row["status"] = "failed"
-            row["info"] = "see log"
+            fr = fail_map.get(path)
+            row["info"] = fr["reason"] if fr else "see log"
         elif decision == "CONVERT":
             row["status"] = "queued"
             queued_orig += size
@@ -656,6 +706,36 @@ def build_status():
 
     # current encode progress
     prog = parse_progress()
+    curm_out = {}
+    if cur_music_src:
+        _msz = curm.get("size") or 0
+        _mdur = float(curm.get("duration") or 0)
+        mprog = {}
+        try:
+            with open(CUR_MUSIC_PROG, errors="replace") as _f:
+                for _l in _f:
+                    if "=" in _l:
+                        _k, _v = _l.rstrip("\n").split("=", 1)
+                        mprog[_k] = _v
+        except Exception:
+            pass
+        def _mf(v):
+            try: return float(v)
+            except (TypeError, ValueError): return 0.0
+        m_us = _mf(mprog.get("out_time_us")) or _mf(mprog.get("out_time_ms"))
+        m_s = m_us / 1_000_000 if m_us else 0
+        m_pct = min(100, m_s / _mdur * 100) if _mdur else 0
+        curm_out = {
+            "base": curm.get("base", ""),
+            "human": human(_msz),
+            "why": curm.get("why", ""),
+            "pct": round(m_pct, 1),
+            "out_time": time.strftime("%H:%M:%S", time.gmtime(m_s)) if m_s else "00:00:00",
+            "dur": time.strftime("%H:%M:%S", time.gmtime(_mdur)) if _mdur else "?",
+            "speed": mprog.get("speed", "?"),
+            "elapsed_s": round(time.time() - float(curm.get("start") or time.time())),
+        }
+
     cur_out = {}
     if cur_src:
         dur = float(cur.get("duration") or 0)
@@ -669,6 +749,20 @@ def build_status():
         out_us = _f(prog.get("out_time_us")) or _f(prog.get("out_time_ms"))
         out_s = out_us / 1_000_000 if out_us else 0
         pct = min(100, out_s / dur * 100) if dur else 0
+        # Some encodes report out_time=N/A through -progress (timestamps unavailable
+        # to the muxer) while frame= keeps counting. Fall back to frame-based percent
+        # so the bar reflects real progress instead of sitting at 0%.
+        frames_done = _f(prog.get("frame"))
+        total_frames = _f(cur.get("total_frames"))
+        fps_src = _f(cur.get("fps_src"))
+        if not fps_src:
+            fps_src = source_fps(cur_src)
+        if not total_frames and dur and fps_src:
+            total_frames = dur * fps_src
+        if pct <= 0 and frames_done and total_frames:
+            pct = min(100, frames_done / total_frames * 100)
+            if not out_s and fps_src:
+                out_s = frames_done / fps_src
         try:
             spd = float(prog.get("speed", "").rstrip("x"))
         except ValueError:
@@ -722,13 +816,61 @@ def build_status():
                        failed=fl, ready=ready, needs=q + c,
                        health=round(ready / tot * 100, 1) if tot else None)
         else:
-            lib.update(kind="music", status=music_status(), **music_counts(lib["realpath"]))
+            rp = lib["realpath"].rstrip("/") + "/"
+            d = q = c = 0
+            for decision, detail, size, path in plan_rows:
+                if not detail.startswith("audio:") or not path.startswith(rp):
+                    continue
+                stem = os.path.basename(path).rsplit(".", 1)[0]
+                dest = os.path.join(os.path.dirname(path), stem + ".mp3")
+                if dest in done_set or path in done_set or decision == "DONE":
+                    d += 1
+                elif path == cur_music_src:
+                    c += 1
+                elif decision == "CONVERT":
+                    q += 1
+            mc = music_counts(lib["realpath"])
+            tracks = mc.get("tracks") or 0
+            # health = share of the library already at or below the house target
+            health = round(mc.get("lossy", 0) / tracks * 100, 1) if tracks else None
+            lib.update(kind="music", status=music_status(),
+                       queued=q, done=d, converting=c, needs=q + c,
+                       health=health, **mc)
+
+    # overall audio queue progress (all audio rows across every music library)
+    a_done = a_queued = a_conv = 0
+    for decision, detail, size, path in plan_rows:
+        if not detail.startswith("audio:"):
+            continue
+        stem = os.path.basename(path).rsplit(".", 1)[0]
+        dest = os.path.join(os.path.dirname(path), stem + ".mp3")
+        if dest in done_set or path in done_set or decision == "DONE":
+            a_done += 1
+        elif path == cur_music_src:
+            a_conv += 1
+        elif decision == "CONVERT":
+            a_queued += 1
+    a_total = a_done + a_queued + a_conv
+    audio_summary = {
+        "done": a_done, "queued": a_queued, "converting": a_conv, "total": a_total,
+        "pct": round(a_done / a_total * 100, 1) if a_total else 0,
+    }
+
+    # group failures by reason class so a systemic bug is visible at a glance
+    fail_classes = {}
+    for _p, _v in fail_map.items():
+        cls = (_v.get("reason") or "?").split(" ")[0]
+        fail_classes[cls] = fail_classes.get(cls, 0) + 1
+    fail_top = sorted(fail_classes.items(), key=lambda kv: -kv[1])[:5]
 
     free, total = drive_free()
     return {
         "batch_running": batch_running(),
         "encoder_running": encoder_running(),
         "current": cur_out,
+        "current_music": curm_out,
+        "audio": audio_summary,
+        "fail_classes": fail_top,
         "files": files,
         "libraries": libs,
         "system": system_status(),
@@ -853,6 +995,7 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
 &nbsp;·&nbsp; <span id=who></span><a href="/logout" style="color:var(--accent)">logout</a></div></header>
 <div class=wrap>
  <div class=cur id=cur></div>
+ <div class=cur id=curmusic></div>
  <div class=layout>
   <div class=left>
    <div class=cards id=cards></div>
@@ -932,6 +1075,23 @@ function render(){
    `<span>${c.eta_min!=null?'eta ~'+c.eta_min+'m':''}</span><span>output ${c.scratch_size}</span></div>`;
  } else cd.style.display='none';
 
+ // audio worker (ruby-music.sh) runs independently of the video encoder
+ const m=data.current_music, md=document.getElementById('curmusic');
+ if(md){
+  if(m&&m.base){
+   md.style.display='block';
+   const a=data.audio||{};
+   md.innerHTML=`<b>Now converting (audio):</b> ${esc(m.base)} <span class=muted>(${m.human})</span>`+
+    `<span class=tier>${esc(m.why||'')}</span>`+
+    `<div class=bar><i style="width:${m.pct||0}%"></i></div>`+
+    `<div class=row><span>${m.pct||0}% &nbsp; ${esc(m.out_time||'')}/${esc(m.dur||'?')}</span>`+
+    `<span>speed ${esc(m.speed||'?')}</span><span>elapsed ${m.elapsed_s}s</span></div>`+
+    (a.total?`<div class=pbar style="margin-top:6px"><i style="width:${a.pct}%;background:#5fd0ff"></i></div>`+
+      `<div class=row><span class=muted>audio queue ${a.done}/${a.total} (${a.pct}%)</span>`+
+      `<span class=muted>⧗ ${a.queued} queued</span></div>`:'');
+  } else md.style.display='none';
+ }
+
  // server hardware as individual stat cards
  const sys=data.system||{}, h=sys.host||{}, px=sys.plex||{}, gv=sys.governor||{};
  const sev=(v,y,r)=> (v==null||v<0)?'#1f9bd1':(v>=r?'#ff6b6b':(v>=y?'#e0b33a':'#2bd47a'));
@@ -957,15 +1117,13 @@ function render(){
     `<div class=muted style="font-size:11px;margin:-4px 0 6px">${esc(L.realpath||L.path||'')}</div>`;
    if(L.kind==='music'){
     const s=L.status;
-    const tot=s?s.total:(L.tracks||0), good=s?s.good:0;
-    const hp=(s&&tot)?Math.round(good/tot*1000)/10:null;
+    const hp=(L.health==null?null:L.health);
     const col=hp==null?'#8b95a7':(hp>=90?'#2bd47a':hp>=60?'#e0b33a':'#ff6b6b');
-    let line = s
-      ? `<span style="color:${col};font-weight:600">${hp}% good</span>`+
-        `<span style="color:#6fe39a">✓ ${s.good} done</span>`+
-        `<span style="color:#e0b33a">⚖ ${s.need_gain} need leveling</span>`+
-        (s.need_convert?`<span style="color:#ff8b8b">⤳ ${s.need_convert} need convert</span>`:'')
-      : `<span class=muted>analysis pending (music pass runs every 3h)…</span>`;
+    let line = `<span style="color:${col};font-weight:600">${hp==null?'—':hp+'% at target'}</span>`+
+        `<span style="color:#6fe39a">✓ ${L.done||0} converted</span>`+
+        ((L.converting||0)?`<span style="color:#5fd0ff">◍ ${L.converting} converting</span>`:'')+
+        ((L.queued||0)?`<span style="color:#c6cfdd">⧗ ${L.queued} queued</span>`:'')+
+        (s?`<span style="color:#e0b33a">⚖ ${s.need_gain} need leveling</span>`:'');
     return `<div class=lib>${head}`+
      `<div class=pbar><i style="width:${hp||0}%;background:${col}"></i></div>`+
      `<div class=row style="margin-top:6px">${line}`+
