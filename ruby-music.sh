@@ -137,7 +137,14 @@ to_mp3(){
   printf '{"src":"%s","base":"%s","size":%s,"duration":%s,"why":"%s","start":%s}\n' \
     "${f//\"/}" "${f##*/}" "${osz:-0}" "${od:-0}" "${why//\"/}" "$(date +%s)" > "$CUR_MUSIC"
   : > "$CUR_MUSIC_PROG"
+  # Carry embedded cover art across (FLAC PICTURE -> ID3 APIC). Mapping audio alone
+  # silently stripped it from every converted album. If the art stream can't be
+  # muxed into MP3, retry audio-only rather than fail the track.
   if nice -n 15 ffmpeg -nostdin -hide_banner -loglevel error -y -progress "$CUR_MUSIC_PROG" -i "$f" \
+        -map 0:a:0 -c:a libmp3lame -b:a "${MUSIC_TARGET_KBPS}k" \
+        -map '0:v:0?' -c:v copy -disposition:v:0 attached_pic \
+        -map_metadata 0 -id3v2_version 3 -write_id3v1 1 "$tmp" 2>>"$LOG" \
+     || nice -n 15 ffmpeg -nostdin -hide_banner -loglevel error -y -progress "$CUR_MUSIC_PROG" -i "$f" \
         -map 0:a:0 -c:a libmp3lame -b:a "${MUSIC_TARGET_KBPS}k" \
         -map_metadata 0 -id3v2_version 3 -write_id3v1 1 "$tmp" 2>>"$LOG"; then
     nc="$(acodec "$tmp")"; nd="$(dur "$tmp")"
