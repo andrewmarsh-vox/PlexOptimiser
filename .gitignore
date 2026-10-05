@@ -4,8 +4,9 @@ state/
 scratch/
 pending/
 
-# Logs
+# Logs (and their logrotate generations)
 *.log
+*.log.*
 
 # Secrets
 .session_secret

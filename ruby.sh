@@ -13,7 +13,7 @@
 #   * shrinks bloated high-bitrate remuxes to efficient HEVC (Intel QSV/VAAPI),
 #   * converts client-incompatible video codecs (VC-1 / MPEG-2 / AV1 / ...) to HEVC,
 #   * adds universally-compatible audio (AC3 5.1 + AAC 2.0) alongside the lossless track,
-#   * keeps lossless primary+English audio and English subtitles,
+#   * keeps English audio only (untagged tracks kept when nothing is tagged English) and English subtitles,
 #   * then tells Plex to re-index each optimised file so its database matches.
 #
 # Libraries to scan + their Plex section ids are discovered from Plex itself (API key).
@@ -209,12 +209,20 @@ _astreams(){  # $1=file
     done | awk '!seen[$1]++'   # dedupe: m2ts lists streams once per BDAV program
 }
 
-# audio to keep (echo space-separated SOURCE stream indices):
-#   1. the primary (first) track — usually the lossless one;
-#   2. the first English track, only if the primary isn't English (foreign films);
-#   3. the first already-direct-play-compatible track, if 1+2 didn't already catch one.
+# audio to keep (echo space-separated SOURCE stream indices). English only:
+#   1. if any track is tagged English (eng/en): keep the first English track, drop
+#      every non-English track;
+#   2. if NONE is tagged English: keep every UNTAGGED track (raw m2ts rarely tags
+#      languages, so the English one is almost certainly among them) and drop tracks
+#      tagged with another language. Before this rule, a "rus dub first + untagged
+#      English" Blu-ray kept only the Russian dub (Miss Congeniality, Zulu, Waterworld,
+#      Borat... lost their English in Sep/Oct 2026);
+#   3. if there is no English and nothing untagged (a genuinely foreign-language
+#      release), keep the primary track so the file still has sound;
+#   4. then add the first already-direct-play-compatible track among the kept
+#      language(s), if 1-3 didn't already catch one.
 #
-# Rule 3 matters more than it looks. A typical remux is "DTS-HD MA primary + AC3
+# Rule 4 matters more than it looks. A typical remux is "DTS-HD MA primary + AC3
 # companion": has_good_audio() saw the AC3 and correctly decided no tracks needed
 # ADDING, but the keep list was primary-only, so the AC3 was silently DROPPED. The
 # output then had lossless-only audio and every TV had to transcode it — the exact
@@ -223,34 +231,36 @@ _astreams(){  # $1=file
 audio_keep_idxs(){
   local f="$1"; mapfile -t rows < <(_astreams "$f")
   [ ${#rows[@]} -eq 0 ] && return 1
-  local r idx lang cod g out="" first_lang
-  read -r idx first_lang cod <<<"${rows[0]}"
-  out="$idx"
-  if [ "$first_lang" != "eng" ]; then
-    for r in "${rows[@]:1}"; do read -r idx lang cod <<<"$r"
-      [ "$lang" = "eng" ] && { out="$out $idx"; break; }
+  local r idx lang cod g out="" keep_lang
+  for r in "${rows[@]}"; do read -r idx lang cod <<<"$r"
+    case "$lang" in eng|en) out="$idx"; keep_lang=eng; break ;; esac
+  done
+  if [ -z "$out" ]; then
+    for r in "${rows[@]}"; do read -r idx lang cod <<<"$r"
+      [ "$lang" = und ] && out="${out:+$out }$idx"
     done
+    [ -n "$out" ] && keep_lang=und
+  fi
+  if [ -z "$out" ]; then
+    read -r idx keep_lang cod <<<"${rows[0]}"; out="$idx"
   fi
   # do the kept tracks already include a TV-friendly codec?
-  local havegood=0 i
+  local i
   for i in $out; do
     for r in "${rows[@]}"; do read -r idx lang cod <<<"$r"
       [ "$idx" = "$i" ] || continue
-      for g in $GOOD_AUDIO; do [ "$cod" = "$g" ] && havegood=1; done
+      for g in $GOOD_AUDIO; do [ "$cod" = "$g" ] && { printf '%s\n' "$out"; return 0; }; done
     done
   done
-  # if not, adopt one that already exists — preferring a language we're keeping.
-  if [ "$havegood" = 0 ]; then
-    local want
-    for want in eng any; do
-      for r in "${rows[@]}"; do read -r idx lang cod <<<"$r"
-        [ "$want" = eng ] && [ "$lang" != eng ] && [ "$lang" != "$first_lang" ] && continue
-        for g in $GOOD_AUDIO; do
-          [ "$cod" = "$g" ] && { out="$out $idx"; havegood=1; break 3; }
-        done
-      done
+  # if not, adopt an existing compatible track in the language we're keeping
+  # (if there is none, the caller adds AC3/AAC converted from the kept track).
+  for r in "${rows[@]}"; do read -r idx lang cod <<<"$r"
+    [ "$lang" = en ] && lang=eng
+    [ "$lang" = "$keep_lang" ] || continue
+    for g in $GOOD_AUDIO; do
+      [ "$cod" = "$g" ] && { out="$out $idx"; break 2; }
     done
-  fi
+  done
   printf '%s\n' "$out"
 }
 # subs to keep (echo space-separated indices): all English-tagged; if NONE tagged
